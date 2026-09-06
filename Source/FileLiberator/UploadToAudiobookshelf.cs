@@ -28,6 +28,13 @@ public class UploadToAudiobookshelf : Processable, IProcessable<UploadToAudioboo
 	}
 
 	/// <summary>
+	/// Force ASIN duplicate-checking on for this uploader instance regardless of the
+	/// <see cref="Configuration.AudiobookshelfCheckAsin"/> setting. Used by the CLI
+	/// <c>--check-asin</c> flag. GUI uploads instead read the persistent setting.
+	/// </summary>
+	public bool CheckAsin { get; set; }
+
+	/// <summary>
 	/// Raised exactly once per processed book, classifying what happened and why.
 	/// <para/>
 	/// Upload failures are reported here rather than through the returned <see cref="StatusHandler"/>.
@@ -77,6 +84,8 @@ public class UploadToAudiobookshelf : Processable, IProcessable<UploadToAudioboo
 			var author = libraryBook.Book.AuthorNames;
 			var series = libraryBook.Book.SeriesNames();
 
+			var checkAsin = CheckAsin || Configuration.AudiobookshelfCheckAsin;
+
 			var result = await AudiobookshelfApiService.UploadBookAsync(
 				Configuration.AudiobookshelfServerUrl!,
 				Configuration.AudiobookshelfApiToken!,
@@ -85,7 +94,8 @@ public class UploadToAudiobookshelf : Processable, IProcessable<UploadToAudioboo
 				title,
 				author,
 				series,
-				files);
+				files,
+				asin: checkAsin ? libraryBook.Book.AudibleProductId : null);
 
 			if (result == AudiobookshelfApiService.UploadResult.Success)
 			{

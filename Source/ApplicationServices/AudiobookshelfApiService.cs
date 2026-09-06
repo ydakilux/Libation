@@ -297,12 +297,46 @@ public static class AudiobookshelfApiService
 		}
 	}
 
-	public static async Task<bool> BookExistsAsync(string serverUrl, string apiToken, string libraryId, string title, string? author = null)
+	public static async Task<bool> BookExistsAsync(
+		string serverUrl,
+		string apiToken,
+		string libraryId,
+		string title,
+		string? author = null,
+		string? asin = null)
 	{
 		apiToken = AudiobookshelfTokenStorage.DecryptToken(apiToken) ?? "";
 		using var client = CreateClient(serverUrl);
 		client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiToken);
 		client.Timeout = TimeSpan.FromSeconds(30);
+
+		if (!string.IsNullOrWhiteSpace(asin))
+		{
+			var normalizedAsin = asin.Trim().TrimStart('[').TrimEnd(']');
+			Serilog.Log.Logger.Debug("Audiobookshelf duplicate check: searching by ASIN '{Asin}' in library {LibraryId}", normalizedAsin, libraryId);
+			try
+			{
+				// Audiobookshelf's search endpoint indexes title, subtitle, ASIN, and ISBN from metadata
+				// (see libraryItemsBookFilters.js#L1039). It does NOT index ASINs that only appear in
+				// folder or file names on disk. So we can only reliably detect duplicates whose
+				// Audiobookshelf metadata ASIN matches; filename/folder-only ASINs are out of scope.
+				var asinCandidates = await SearchLibraryAsync(client, libraryId, normalizedAsin, 10);
+				foreach (var candidate in asinCandidates)
+				{
+					if (!string.IsNullOrWhiteSpace(candidate.Asin)
+						&& string.Equals(candidate.Asin, normalizedAsin, StringComparison.OrdinalIgnoreCase))
+					{
+						Serilog.Log.Logger.Information("Audiobookshelf duplicate check: found match by metadata ASIN '{Asin}' (item id={ItemId}, title='{CandidateTitle}')", normalizedAsin, candidate.Id, candidate.FullTitle);
+						return true;
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				Serilog.Log.Logger.Debug(ex, "Audiobookshelf duplicate check by ASIN failed for '{Asin}' in library {LibraryId}", normalizedAsin, libraryId);
+				// Fall through to title matching below
+			}
+		}
 
 		var normalizedTitle = NormalizeTitle(title);
 		var baseTitle = GetBaseTitle(normalizedTitle);
@@ -370,7 +404,7 @@ public static class AudiobookshelfApiService
 		}
 	}
 
-	private record SearchCandidate(string Id, string Title, string FullTitle, List<string> Authors);
+	private record SearchCandidate(string Id, string Title, string FullTitle, List<string> Authors, string? Asin);
 
 	private static async Task<List<SearchCandidate>> SearchLibraryAsync(HttpClient client, string libraryId, string query, int limit)
 	{
@@ -393,6 +427,7 @@ public static class AudiobookshelfApiService
 			var id = item["id"]?.Value<string>() ?? entry["id"]?.Value<string>() ?? "";
 			var itemTitle = item["media"]?["metadata"]?["title"]?.Value<string>()?.Replace("\u00A0", " ").Trim();
 			var itemSubtitle = item["media"]?["metadata"]?["subtitle"]?.Value<string>()?.Replace("\u00A0", " ").Trim();
+			var asin = item["media"]?["metadata"]?["asin"]?.Value<string>()?.Trim();
 
 			var itemFullTitle = string.IsNullOrWhiteSpace(itemSubtitle)
 				? itemTitle
@@ -407,7 +442,8 @@ public static class AudiobookshelfApiService
 				id,
 				NormalizeTitle(itemTitle),
 				NormalizeTitle(itemFullTitle),
-				authorList));
+				authorList,
+				asin));
 		}
 
 		return results;
@@ -483,14 +519,15 @@ public static class AudiobookshelfApiService
 		string title,
 		string? author,
 		string? series,
-		IEnumerable<string> filePaths)
+		IEnumerable<string> filePaths,
+		string? asin = null)
 	{
 		apiToken = AudiobookshelfTokenStorage.DecryptToken(apiToken) ?? "";
 
 		// Pre-check for existing item
 		try
 		{
-			if (await BookExistsAsync(serverUrl, apiToken, libraryId, title, author))
+			if (await BookExistsAsync(serverUrl, apiToken, libraryId, title, author, asin))
 			{
 				Serilog.Log.Logger.Information("Skipping Audiobookshelf upload: book '{Title}' already exists in library {LibraryId}", title, libraryId);
 				return UploadResult.AlreadyExists;
