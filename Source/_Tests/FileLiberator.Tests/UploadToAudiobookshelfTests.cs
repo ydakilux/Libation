@@ -7,20 +7,36 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Threading.Tasks;
 
 namespace FileLiberator.Tests;
 
 /// <summary>
-/// <see cref="Configuration.CreateMockInstance"/> replaces the process-wide
-/// <see cref="Configuration.Instance"/>, so these tests must not run alongside others.
+	/// Configuration uses process-wide test state, so these tests must not run alongside others.
 /// </summary>
 [TestClass]
 [DoNotParallelize]
 public class UploadToAudiobookshelfTests
 {
+	private string testFilesDirectory = string.Empty;
+	private string? previousFilesDirectory;
+
+	[TestInitialize]
+	public void IsolateFileCache()
+	{
+		previousFilesDirectory = Environment.GetEnvironmentVariable(LibationFiles.LIBATION_FILES_DIR);
+		testFilesDirectory = CreateEmptyBooksDirectory();
+		Environment.SetEnvironmentVariable(LibationFiles.LIBATION_FILES_DIR, testFilesDirectory);
+	}
+
 	[TestCleanup]
-	public void RestoreConfiguration() => Configuration.RestoreSingletonInstance();
+	public void RestoreConfiguration()
+	{
+		Configuration.RestoreSingletonInstance();
+		Environment.SetEnvironmentVariable(LibationFiles.LIBATION_FILES_DIR, previousFilesDirectory);
+		Directory.Delete(testFilesDirectory, recursive: true);
+	}
 
 	private static Configuration ConfiguredForAudiobookshelf()
 	{
@@ -254,6 +270,119 @@ public class UploadToAudiobookshelfTests
 		return booksDirectory;
 	}
 
+	[TestMethod]
+	public void Pdf_setting_defaults_off_and_round_trips()
+	{
+		var config = ConfiguredForAudiobookshelf();
+		Assert.IsFalse(config.AudiobookshelfIncludePdfs);
+		foreach (var enabled in new[] { true, false })
+		{
+			config.AudiobookshelfIncludePdfs = enabled;
+			Assert.AreEqual(enabled, config.CreateEphemeralCopy().AudiobookshelfIncludePdfs);
+		}
+	}
+
+	[TestMethod]
+	public void BuildUploadFileList_appends_distinct_pdfs_after_cover_and_excludes_zip()
+	{
+		var files = UploadToAudiobookshelf.BuildUploadFileList(
+			["book.m4b"], "cover.jpg", ["b.pdf", "a.PDF", "b.pdf", "supplement.zip"]);
+		CollectionAssert.AreEqual(new[] { "book.m4b", "cover.jpg", "a.PDF", "b.pdf" }, files);
+	}
+
+	[TestMethod]
+	public void BuildUploadFileList_requires_audio_even_with_attachments()
+	{
+		Assert.AreEqual(0, UploadToAudiobookshelf.BuildUploadFileList(
+			["cover.jpg", "book.pdf"], "cover.jpg", ["book.pdf"]).Count);
+	}
+
+	[TestMethod]
+	public void ClassifyUploadFailure_classifies_connection_socket_errors()
+	{
+		Assert.AreEqual(UploadToAudiobookshelf.UploadFailureKind.Network,
+			UploadToAudiobookshelf.ClassifyUploadFailure(new SocketException((int)SocketError.ConnectionReset)));
+	}
+
+	[TestMethod]
+	public void ClassifyUploadFailure_classifies_connection_http_errors()
+	{
+		var error = new HttpRequestException(HttpRequestError.NameResolutionError, "not a classification input");
+
+		Assert.AreEqual(UploadToAudiobookshelf.UploadFailureKind.Network,
+			UploadToAudiobookshelf.ClassifyUploadFailure(error));
+	}
+
+	[TestMethod]
+	public void ClassifyUploadFailure_does_not_treat_local_stream_io_as_connection_loss()
+	{
+		var error = new HttpRequestException("upload stream failed", new IOException("disk read failed"));
+
+		Assert.AreEqual(UploadToAudiobookshelf.UploadFailureKind.Other,
+			UploadToAudiobookshelf.ClassifyUploadFailure(error));
+	}
+
+	[TestMethod]
+	public void ClassifyUploadFailure_cancellation_wrapping_socket_reset_is_cancellation()
+	{
+		var error = new IOException("wrapper", new OperationCanceledException(
+			"request cancelled", new SocketException((int)SocketError.ConnectionReset)));
+
+		Assert.AreEqual(UploadToAudiobookshelf.UploadFailureKind.Cancellation,
+			UploadToAudiobookshelf.ClassifyUploadFailure(error));
+	}
+
+	[TestMethod]
+	public void FormatUploadFailure_is_single_line_and_does_not_require_configuration()
+	{
+		var message = UploadToAudiobookshelf.FormatUploadFailure(
+			new SocketException((int)SocketError.ConnectionRefused));
+
+		StringAssert.Contains(message, "network failure");
+		StringAssert.Contains(message, "See log for details.");
+		Assert.IsFalse(message.Contains('\n'));
+		Assert.IsFalse(message.Contains("localhost", StringComparison.OrdinalIgnoreCase));
+	}
+
+	[TestMethod]
+	public void GetFilesToUpload_includes_only_existing_pdfs_for_this_book_when_enabled()
+	{
+		var directory = CreateEmptyBooksDirectory();
+		try
+		{
+			var config = ConfiguredForAudiobookshelf();
+			config.Books = directory;
+			// Cover-art naming reads account nicknames, even when no cover exists.
+			AudibleUtilities.AudibleApiStorage.EnsureAccountsSettingsFileExists();
+			var book = LibraryBookWith(LiberatedStatus.Liberated);
+			var audio = Path.Combine(directory, "B0TEST0001.m4b");
+			var pdf = Path.Combine(directory, "supplement.pdf");
+			var secondPdf = Path.Combine(directory, "second.PDF");
+			var otherPdf = Path.Combine(directory, "other.pdf");
+			var untrackedPdf = Path.Combine(directory, "untracked.pdf");
+			var zip = Path.Combine(directory, "supplement.zip");
+			foreach (var path in new[] { audio, pdf, secondPdf, otherPdf, untrackedPdf, zip })
+				File.WriteAllText(path, "test content");
+			FilePathCache.Insert(book.Book.AudibleProductId, audio, pdf, secondPdf, zip, Path.Combine(directory, "missing.pdf"));
+			FilePathCache.Insert("B0OTHER001", otherPdf);
+			var sut = UploadToAudiobookshelf.Create(config);
+			string[] Paths() => sut.GetFilesToUpload(book)
+				.Select(p => ((LongPath)p).PathWithoutPrefix).ToArray();
+
+			CollectionAssert.AreEquivalent(new[] { audio }, Paths());
+			config.AudiobookshelfIncludePdfs = true;
+			CollectionAssert.AreEquivalent(new[] { audio, pdf, secondPdf }, Paths());
+			File.Delete(pdf);
+			CollectionAssert.AreEquivalent(new[] { audio, secondPdf }, Paths());
+			File.Delete(audio);
+			Assert.AreEqual(0, Paths().Length);
+		}
+		finally
+		{
+			Directory.Delete(directory, recursive: true);
+		}
+	}
+
 	/// <summary>
 	/// Books liberated before the path cache existed - or whose cache was lost - have no
 	/// <see cref="FilePathCache"/> entry. Backfill must still find them by scanning the Books
@@ -285,44 +414,5 @@ public class UploadToAudiobookshelfTests
 		{
 			Directory.Delete(booksDirectory, recursive: true);
 		}
-	}
-
-	[TestMethod]
-	public void FormatUploadErrorMessage_stream_copy_error_provides_actionable_diagnostics()
-	{
-		var inner = new IOException("An existing connection was forcibly closed by the remote host.");
-		var ex = new HttpRequestException("Error while copying content to a stream.", inner);
-
-		var message = UploadToAudiobookshelf.FormatUploadErrorMessage(ex);
-
-		StringAssert.Contains(message, "Connection lost while sending audio files to the server");
-		StringAssert.Contains(message, "An existing connection was forcibly closed by the remote host");
-		StringAssert.Contains(message, "client_max_body_size");
-		StringAssert.Contains(message, "Reverse proxy or server timeout");
-		StringAssert.Contains(message, "Log.log");
-	}
-
-	[TestMethod]
-	public void FormatUploadErrorMessage_timeout_error_provides_timeout_message()
-	{
-		var ex = new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout.");
-
-		var message = UploadToAudiobookshelf.FormatUploadErrorMessage(ex);
-
-		StringAssert.Contains(message, "timed out or was cancelled");
-		StringAssert.Contains(message, "Log.log");
-	}
-
-	[TestMethod]
-	public void FormatUploadErrorMessage_unwraps_base_exception()
-	{
-		var root = new InvalidOperationException("Root failure reason");
-		var middle = new Exception("Middle failure", root);
-		var top = new Exception("Top failure", middle);
-
-		var message = UploadToAudiobookshelf.FormatUploadErrorMessage(top);
-
-		StringAssert.Contains(message, "Top failure (Root failure reason)");
-		StringAssert.Contains(message, "Log.log");
 	}
 }

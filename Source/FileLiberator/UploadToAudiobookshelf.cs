@@ -7,12 +7,16 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Sockets;
 using System.Threading.Tasks;
 
 namespace FileLiberator;
 
 public class UploadToAudiobookshelf : Processable, IProcessable<UploadToAudiobookshelf>
 {
+	internal enum UploadFailureKind { Cancellation, Network, Other }
+
 	public override string Name => "Upload to Audiobookshelf";
 
 	public enum UploadOutcome { Uploaded, AlreadyExists, NoFilesFound, Failed }
@@ -104,17 +108,17 @@ public class UploadToAudiobookshelf : Processable, IProcessable<UploadToAudioboo
 				OnStatusUpdate(message);
 				Serilog.Log.Logger.Error("Audiobookshelf upload failed for {Book}, but continuing as soft-failure", libraryBook.LogFriendly());
 				// Soft-fail: log the error but do not mark the book as failed
-				OnOutcomeDetermined(UploadOutcome.Failed, message + $". See Libation log ({Path.Combine(Configuration.Instance.LibationFiles.Location, "Log.log")}) and Audiobookshelf server logs for details.");
+				OnOutcomeDetermined(UploadOutcome.Failed, message + ". See log for details.");
 				return new StatusHandler();
 			}
 		}
 		catch (Exception ex)
 		{
-			Serilog.Log.Logger.Error(ex, "Error uploading {Book} to Audiobookshelf; continuing as soft-failure", libraryBook.LogFriendly());
-			var errorMessage = FormatUploadErrorMessage(ex);
-			OnStatusUpdate(errorMessage);
+			var message = FormatUploadFailure(ex);
+			Serilog.Log.Logger.Error(ex, "Audiobookshelf upload failed; continuing as soft-failure. See log for details.");
+			OnStatusUpdate(message);
 			// Soft-fail: log the error but do not mark the book as failed
-			OnOutcomeDetermined(UploadOutcome.Failed, errorMessage);
+			OnOutcomeDetermined(UploadOutcome.Failed, message);
 			return new StatusHandler();
 		}
 		finally
@@ -123,45 +127,76 @@ public class UploadToAudiobookshelf : Processable, IProcessable<UploadToAudioboo
 		}
 	}
 
-	internal static string FormatUploadErrorMessage(Exception ex)
+	internal static UploadFailureKind ClassifyUploadFailure(Exception ex)
 	{
-		var baseEx = ex.GetBaseException();
-		var baseMsg = baseEx?.Message?.Trim();
-		var logFile = Path.Combine(Configuration.Instance.LibationFiles.Location, "Log.log");
+		// Cancellation must win over a SocketException/HttpRequestException nested in a wrapper.
+		if (ContainsException<OperationCanceledException>(ex))
+			return UploadFailureKind.Cancellation;
 
-		var isStreamCopyError = ex.Message.Contains("Error while copying content to a stream", StringComparison.OrdinalIgnoreCase)
-			|| (baseMsg?.Contains("forcibly closed", StringComparison.OrdinalIgnoreCase) == true)
-			|| (baseMsg?.Contains("connection reset", StringComparison.OrdinalIgnoreCase) == true)
-			|| (baseMsg?.Contains("broken pipe", StringComparison.OrdinalIgnoreCase) == true)
-			|| (baseMsg?.Contains("ended prematurely", StringComparison.OrdinalIgnoreCase) == true);
-
-		if (isStreamCopyError)
+		for (var current = ex; current is not null; current = current.InnerException)
 		{
-			var reason = !string.IsNullOrWhiteSpace(baseMsg) && !string.Equals(baseMsg, ex.Message, StringComparison.OrdinalIgnoreCase)
-				? $" ({baseMsg})"
-				: "";
+			if (current is SocketException socket
+				&& IsConnectionSocketError(socket.SocketErrorCode))
+				return UploadFailureKind.Network;
 
-			return $"Audiobookshelf upload error: Connection lost while sending audio files to the server{reason}.\n"
-				+ "  Possible causes:\n"
-				+ "  - Reverse proxy upload limit: if using Nginx/Cloudflare/Traefik, ensure 'client_max_body_size' (or equivalent proxy upload limit) is large enough for audiobook files (e.g. 1G or higher).\n"
-				+ "  - Reverse proxy or server timeout: the upload may have exceeded proxy timeout limits.\n"
-				+ "  - Server disk space or Audiobookshelf crash: verify the server has sufficient free storage.\n"
-				+ $"  Check Audiobookshelf server logs and the Libation log ({logFile}) for details.";
+			if (current is HttpRequestException request
+				&& IsConnectionHttpError(request.HttpRequestError))
+				return UploadFailureKind.Network;
+
+			if (current is HttpIOException http
+				&& IsConnectionHttpError(http.HttpRequestError))
+				return UploadFailureKind.Network;
 		}
 
-		if (ex is TaskCanceledException or TimeoutException)
-		{
-			return $"Audiobookshelf upload timed out or was cancelled.\n"
-				+ $"  Check Audiobookshelf server logs and the Libation log ({logFile}) for details.";
-		}
-
-		var detail = !string.IsNullOrWhiteSpace(baseMsg) && !string.Equals(baseMsg, ex.Message, StringComparison.OrdinalIgnoreCase)
-			? $"{ex.Message} ({baseMsg})"
-			: ex.Message;
-
-		return $"Audiobookshelf upload error: {detail}\n"
-			+ $"  Check Audiobookshelf server logs and the Libation log ({logFile}) for details.";
+		return UploadFailureKind.Other;
 	}
+
+	internal static string FormatUploadFailure(Exception ex)
+	{
+		var kind = ClassifyUploadFailure(ex);
+		var category = kind switch
+		{
+			UploadFailureKind.Cancellation => "cancelled or timed out",
+			UploadFailureKind.Network => "network failure",
+			_ => "failure"
+		};
+
+		var detail = ex.GetBaseException().Message.ReplaceLineEndings(" ").Trim();
+		return $"Audiobookshelf upload {category}: {detail}. See log for details.";
+	}
+
+	private static bool ContainsException<T>(Exception ex) where T : Exception
+	{
+		for (var current = ex; current is not null; current = current.InnerException)
+			if (current is T)
+				return true;
+		return false;
+	}
+
+	private static bool IsConnectionSocketError(SocketError error)
+		=> error is SocketError.ConnectionAborted
+			or SocketError.ConnectionRefused
+			or SocketError.ConnectionReset
+			or SocketError.HostDown
+			or SocketError.HostNotFound
+			or SocketError.HostUnreachable
+			or SocketError.NetworkDown
+			or SocketError.NetworkReset
+			or SocketError.NetworkUnreachable
+			or SocketError.NoData
+			or SocketError.NotInitialized
+			or SocketError.Shutdown
+			or SocketError.TimedOut
+			or SocketError.TryAgain;
+
+	private static bool IsConnectionHttpError(HttpRequestError error)
+		=> error is HttpRequestError.ConnectionError
+			or HttpRequestError.NameResolutionError
+			or HttpRequestError.SecureConnectionError
+			or HttpRequestError.ProxyTunnelError
+			or HttpRequestError.ResponseEnded
+			or HttpRequestError.HttpProtocolError
+			or HttpRequestError.InvalidResponse;
 
 	/// <summary>
 	/// Resolves a book's audio files by both the path cache and a live scan of the Books directory.
@@ -177,14 +212,18 @@ public class UploadToAudiobookshelf : Processable, IProcessable<UploadToAudioboo
 
 	/// <summary>
 	/// Composes the final upload payload from one preferred audio format, in deterministic order,
-	/// followed by cover art at most once.
+	/// followed by cover art and optional PDFs at most once.
 	/// </summary>
-	internal static List<string> BuildUploadFileList(IEnumerable<string> audioPaths, string? coverPath)
+	internal static List<string> BuildUploadFileList(IEnumerable<string> audioPaths, string? coverPath, IEnumerable<string>? pdfPaths = null)
 	{
 		var audioFiles = audioPaths
 			.Where(p => !string.IsNullOrWhiteSpace(p))
+			.Where(p => FileTypes.GetFileTypeFromPath(p) == FileType.Audio)
 			.Distinct(StringComparer.Ordinal)
 			.ToList();
+
+		if (audioFiles.Count == 0)
+			return [];
 
 		var m4bFiles = audioFiles
 			.Where(p => p.EndsWith(".m4b", StringComparison.OrdinalIgnoreCase))
@@ -203,14 +242,27 @@ public class UploadToAudiobookshelf : Processable, IProcessable<UploadToAudioboo
 		if (!string.IsNullOrWhiteSpace(coverPath))
 			files.Add(coverPath);
 
-		return files;
+		files.AddRange((pdfPaths ?? [])
+			.Where(p => !string.IsNullOrWhiteSpace(p) && FileTypes.GetFileTypeFromPath(p) == FileType.PDF)
+			.OrderBy(p => p, StringComparer.Ordinal));
+
+		return files.Distinct(StringComparer.Ordinal).ToList();
 	}
 
-	internal static List<string> GetFilesToUpload(LibraryBook libraryBook)
+	internal List<string> GetFilesToUpload(LibraryBook libraryBook)
 	{
 		var audioFiles = GetAudioFilesOnDisk(libraryBook.Book.AudibleProductId);
+		if (audioFiles.Count == 0)
+			return [];
 
-		return BuildUploadFileList(audioFiles, GetCoverArtPath(libraryBook, audioFiles.FirstOrDefault()));
+		var pdfFiles = Configuration.AudiobookshelfIncludePdfs
+			? FilePathCache.GetFiles(libraryBook.Book.AudibleProductId)
+				.Where(f => f.fileType == FileType.PDF)
+				.Select(f => (string)f.path)
+				.Where(File.Exists)
+			: Enumerable.Empty<string>();
+
+		return BuildUploadFileList(audioFiles, GetCoverArtPath(libraryBook, audioFiles.FirstOrDefault()), pdfFiles);
 	}
 
 	/// <summary>Libation's known cover art output path. Same logic as DownloadDecryptBook.DownloadCoverArt.</summary>
