@@ -522,29 +522,21 @@ public static class AudiobookshelfApiService
 		long totalBytes = 0;
 		foreach (var path in existingFiles)
 		{
-			try { totalBytes += new FileInfo(path).Length; } catch { }
+			try { totalBytes += new FileInfo(path).Length; }
+			catch (Exception ex) { Serilog.Log.Logger.Warning(ex, "Could not read file length for Audiobookshelf upload: {Path}", path); }
 		}
-
-		progress?.Report((0, totalBytes));
 
 		long bytesSent = 0;
-		void OnBytesRead(int count)
-		{
-			var current = System.Threading.Interlocked.Add(ref bytesSent, count);
-			progress?.Report((current, totalBytes));
-		}
+		void OnBytesRead(int count) => progress?.Report((System.Threading.Interlocked.Add(ref bytesSent, count), totalBytes));
 
 		int fileIndex = 0;
-		var streams = new List<Stream>();
 		try
 		{
+			progress?.Report((0, totalBytes));
 			foreach (var path in existingFiles)
 			{
-				var fileStream = File.OpenRead(path);
-				streams.Add(fileStream);
-				var progressStream = new ProgressStream(fileStream, OnBytesRead);
-				streams.Add(progressStream);
-				var fileContent = new StreamContent(progressStream);
+				var stream = File.OpenRead(path);
+				var fileContent = new StreamContent(new ProgressStream(stream, OnBytesRead));
 				fileContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
 				form.Add(fileContent, fileIndex.ToString(), Path.GetFileName(path));
 				fileIndex++;
@@ -577,12 +569,10 @@ public static class AudiobookshelfApiService
 
 			return UploadResult.Failed;
 		}
-		finally
+		catch (Exception ex)
 		{
-			foreach (var stream in streams)
-			{
-				try { stream.Dispose(); } catch { /* ignored */ }
-			}
+			Serilog.Log.Logger.Error(ex, "Audiobookshelf upload failed for '{Title}'", title);
+			return UploadResult.Failed;
 		}
 	}
 }
