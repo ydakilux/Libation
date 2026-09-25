@@ -105,22 +105,33 @@ static class Program
 		catch (Exception ex)
 		{
 			string? crashLogFile = null;
+			bool submittedToLogger = false;
 			try
 			{
 				if (Configuration.Instance.SerilogInitialized)
+				{
 					Log.Error(ex, "Fatal error during startup");
-				else
-					crashLogFile = PreLoggingCrashLog.TryWrite(ex, [("ReleaseIdentifier", LibationScaffolding.ReleaseIdentifier.ToString())]);
+					submittedToLogger = true;
+				}
 			}
-			catch { /* continue to show the dialog even if logging fails */ }
+			catch { /* Attempt fallback logging below. */ }
+
+			if (!submittedToLogger)
+			{
+				try
+				{
+					crashLogFile = PreLoggingCrashLog.TryWrite(ex, [("ReleaseIdentifier", LibationScaffolding.ReleaseIdentifier.ToString())]);
+				}
+				catch { /* Continue to show the crash dialog. */ }
+			}
+
+			var logMessage = CrashLogMessage.Describe(crashLogFile, submittedToLogger, LogFileFilter.LogFilePath);
 
 			var fatalMessage = StartupAssemblyBootstrap.GetFatalStartupMessage(
 				ex,
 				new FatalStartupMessage(
-					"Fatal error, pre-logging",
-					crashLogFile is null
-						? "An unrecoverable error occurred before logging could be initialized, and it could not be written to a log file. Please include the text below when reporting this."
-						: $"An unrecoverable error occurred before logging could be initialized.{Environment.NewLine}{Environment.NewLine}It was written to:{Environment.NewLine}{crashLogFile}"));
+					"Fatal error during startup",
+					$"An unrecoverable error occurred during startup.{Environment.NewLine}{Environment.NewLine}{logMessage}"));
 
 			try
 			{
@@ -175,7 +186,10 @@ static class Program
 		LibationUiBase.Forms.MessageBoxDefaultButton defaultButton,
 		bool _)
 	{
-		Func<DialogResult> showMessageBox = () => MessageBox.Show(
+		Func<DialogResult> showMessageBox = () => caption == LibationUiBase.ContentLicenseDeniedUserMessage.DialogCaption
+			&& buttons == LibationUiBase.Forms.MessageBoxButtons.OK
+			? MessageBoxLib.ShowLicenseRecovery(owner as IWin32Window ?? form1, message, caption)
+			: MessageBox.Show(
 				owner as IWin32Window ?? form1,
 				message,
 				caption,

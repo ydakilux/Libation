@@ -115,7 +115,7 @@ libationcli login-external -a you@example.com -l us --response-url "https://www.
 
 If the account row already has valid saved tokens, the CLI reports that no browser login is needed and exits without opening the flow.
 
-Optional `--device-registration` picks which virtual device to register as on a **new** sign-in: `CurrentAndroid` (default from Settings), `RetailAndroid`, or `Mkb79IPhone`. It does nothing to an account that is already authenticated; remove the account first. See [Device registration](/docs/advanced/device-registration).
+Optional `--device-registration` picks which virtual device to register as on a **new** sign-in: `CurrentAndroid` (the corrected default) or `Mkb79IPhone` (experimental; no Widevine). It does nothing to an account that is already authenticated; remove the account first. See [Device registration](/docs/advanced/device-registration).
 
 ```console
 libationcli login-external --account you@example.com --locale us --device-registration Mkb79IPhone
@@ -172,7 +172,7 @@ The run covers both halves of "book and pdf backups": titles that need downloadi
 
 A title's PDF comes from the same license as its audiobook, so a run that fetches both asks Audible for one license, not two.
 
-Audiobookshelf auto-upload is not part of that second half. It runs when a title is liberated, so a run that only back-fills a PDF does not upload; use `abs upload` to send titles liberated earlier.
+Audiobookshelf auto-upload is not part of that second half. It runs when a title is liberated, so a run that only back-fills a PDF does not upload; use `abs upload` to send titles liberated earlier. Titles already on Audiobookshelf remain skipped, including those missing PDFs.
 
 ## Upload Already-Liberated Books to Audiobookshelf
 
@@ -195,7 +195,15 @@ Requires Audiobookshelf to be enabled and fully configured; otherwise the comman
 libationcli abs upload -o AudiobookshelfServerUrl="https://abs.example.com" -o AudiobookshelfApiToken="..."
 ```
 
-Titles already on the server are skipped. The run ends with a summary of uploaded, already-on-server, no-files-found, failed, and skipped counts. Failures are also written to stderr; the command exits 0 either way. See [Audiobookshelf Auto-Upload](/docs/features/audiobookshelf#uploading-books-you-already-liberated).
+To include known local PDFs with future audiobook uploads, enable **Include PDFs when uploading to Audiobookshelf** in Settings (off by default), or override it for one run:
+
+```console
+libationcli abs upload -o AudiobookshelfIncludePdfs=true
+```
+
+The same setting applies to `liberate`. It includes existing PDFs recorded for the book, regardless of when they were downloaded; missing or untracked PDFs and ZIP supplements are omitted. Audio must be available, and PDFs are never uploaded on their own.
+
+Titles already on the server are skipped, even if they are missing PDFs. The run ends with a summary of uploaded, already-on-server, no-files-found, failed, and skipped counts. Failures are also written to stderr; the command exits 0 either way. See [Audiobookshelf Auto-Upload](/docs/features/audiobookshelf#uploading-books-you-already-liberated).
 
 ## Liberate Pdfs Only
 
